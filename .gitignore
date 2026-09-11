@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+# Measured cohorts contain model outputs and per-run costs; keep them out of the repository.
+results/
