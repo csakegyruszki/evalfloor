@@ -30,14 +30,18 @@ rate is the share of simulations in which the method declared a difference.
 
 | n per arm | bootstrap, independent | bootstrap, paired | exact sign-flip, paired |
 |---:|---:|---:|---:|
-| 3 | 0.120 | 0.270 | 0.000 |
-| 5 | 0.033 | 0.058 | 0.000 |
-| 10 | 0.037 | 0.075 | 0.058 |
-| 20 | 0.043 | 0.055 | 0.050 (Monte Carlo) |
+| 3 | 0.120 | 0.282 | 0.000 |
+| 5 | 0.033 | 0.163 | 0.000 |
+| 10 | 0.037 | 0.113 | 0.058 |
+| 20 | 0.043 | 0.068 | 0.050 (Monte Carlo) |
 
-The paired bootstrap exceeded 0.05 at every n measured, hence the sign-flip
-test in paired mode. This table is reproducible without any model calls:
-`python docs/simulate_aa.py` recomputes it with the same functions and seed. The exact sign-flip test cannot reach p < 0.05 below n = 6
+The paired bootstrap (of the mean paired difference, as the current code
+computes it) exceeded 0.05 at every n measured, hence the sign-flip test decides
+in paired mode and the paired bootstrap CI is descriptive only. The first
+measurement, made when the paired bootstrap still resampled the median, gave
+0.270 / 0.058 / 0.075 / 0.055 for that column and led to the same decision.
+This table is reproducible without any model calls:
+`python docs/simulate_aa.py` recomputes it with the current functions and seed. The exact sign-flip test cannot reach p < 0.05 below n = 6
 (minimum p = 2 / 2^n).
 
 ## 3. Haiku paired A/A smoke with warmup (2026-09-12)

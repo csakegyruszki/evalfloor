@@ -213,10 +213,13 @@ bootstrap resamples:
 
 | n per arm | bootstrap independent | bootstrap paired | exact sign-flip (paired) |
 |---:|---:|---:|---:|
-| 3  | 0.120 | 0.270 | 0.000 |
-| 5  | 0.033 | 0.058 | 0.000 |
-| 10 | 0.037 | 0.075 | 0.058 |
-| 20 | 0.043 | 0.055 | not enumerated |
+| 3  | 0.120 | 0.282 | 0.000 |
+| 5  | 0.033 | 0.163 | 0.000 |
+| 10 | 0.037 | 0.113 | 0.058 |
+| 20 | 0.043 | 0.068 | 0.050 |
+
+(Current code: the paired bootstrap resamples the mean paired difference. Reproduce with
+`python docs/simulate_aa.py`; `docs/MEASUREMENTS.md` also gives the first, median-based figures.)
 
 So **paired mode does not use the bootstrap CI to decide the per-metric result.** It uses
 `signflip_pvalue()` instead: an exact two-sided sign-flip permutation test of the **mean** paired
