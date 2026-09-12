@@ -5,7 +5,7 @@ operational behaviour enough to distinguish it from normal run-to-run noise.
 
 Claude Code is stochastic: the same task can cost noticeably less in one run and more in the next
 with nothing changed. A single before/after run cannot separate a real effect from that noise.
-evalfloor runs each configuration several times into an isolated, fingerprinted cohort, compares
+evalfloor runs each configuration repeatedly (`--repeat N`) into an isolated, fingerprinted cohort, compares
 the two, and reports a difference only when it is larger than the measured noise. It measures how
 the agent works (cost, runtime, failed tool calls, permission denials, tool calls, turns), not
 whether its answer is good. Standard library only, Python 3.9+, no dependencies; it drives
@@ -43,6 +43,14 @@ than its own noise? Pair it with a separate quality check when quality matters.
 `PASS` means cheaper, and not operationally worse on the declared guardrails. It does not mean a
 better agent.
 
+## Requirements
+
+- Python 3.9 or later; standard library only, no installation step. Run `run_eval.py` from a
+  clone.
+- For `run`: the Claude Code CLI (`claude`) on the `PATH` and signed in. Every run is an ordinary,
+  billed `claude -p` session; with the defaults (`--warmup 1`, `--repeat 6`) one arm is seven runs.
+- `compare` makes no model calls and needs only the two cohort directories.
+
 ## Quick start
 
 The `examples/` directory holds a small code-review task, a Python file with planted defects, and
@@ -70,7 +78,7 @@ cohorts (paths are the printed `run dir:` lines from `run`):
 python run_eval.py compare --baseline results/runs/<baseline-id> --treatment results/runs/<treatment-id>
 ```
 
-## Release policy (the defaults)
+## Default decision policy
 
 - **Primary: `cost_usd:decrease`.** Cost is a direct, additive operational outcome, and the most
   stable metric measured (about 7% CV in a Sonnet pilot). The planning heuristic suggests the
@@ -91,8 +99,9 @@ METRIC:increase|decrease` (an ADVERSE direction; giving any `--guardrail` replac
 `--guardrail none` disables them).
 
 `run` also accepts `--agents`, `--system-prompt-file`, `--cwd`, `--timeout`, `--run-id`,
-`--pair-id`, and `--warmup`. Six measured runs per arm is the minimum `compare` needs for a paired
-verdict; with fewer, every metric is `INCONCLUSIVE` by design.
+`--pair-id`, and `--warmup`. `--repeat` defaults to 1, which is only useful for a smoke test. A
+paired comparison needs at least 6 measured runs per arm; with fewer, every paired metric is
+`INCONCLUSIVE` by design. Independent mode accepts `--min-n 5` (see "Decision rule").
 
 ### Zero-tolerance guardrails
 
@@ -114,28 +123,28 @@ audited from the report alone.
 By default, if either cohort has one or more **measured** rows (warmup rows excluded) that did not
 complete, `compare` refuses a verdict: exit code 4, with `validity: "INVALID_FAILED_RUNS"`,
 `failed_baseline` and `failed_treatment` in the report. Silently dropping failed runs is a
-selection bias - the cohort that kept fewer or easier runs looks artificially better.
+selection bias: the cohort that kept fewer or easier runs looks artificially better.
 `--allow-failed-runs` proceeds anyway with `validity: "DEGRADED_FAILED_RUNS"` and the same counts,
 and caps the verdict at `INCONCLUSIVE`: exit 0 is impossible in this mode, whatever the remaining
 completed runs show (`FAIL`, exit 6, is still possible). A clean comparison reports
 `validity: "VALID"`.
 
-A failed **warmup** now stops `run` itself immediately, before any measured run executes: an error
-is printed and exit code 3 returned, leaving the manifest and the failed warmup row on disk.
-Previously a failed warmup was silently ignored and all measured runs still ran with exit code 0.
+A failed **warmup** stops `run` before any measured run executes: an error is printed, exit code 3
+is returned, and the manifest and the failed warmup row stay on disk.
 
 ## Warmup runs
 
 `--warmup N` (default 1, must be >= 0) executes N runs before the measured ones: the first run in
-a cohort pays a cold prompt-cache cost (a Haiku smoke run measured 67,026 cache-creation tokens on
+a cohort pays a cold prompt-cache cost (an exploratory Claude Haiku run measured 67,026 cache-creation tokens on
 the first run vs about 33,500 on every later one, about $0.152 vs $0.088), and whichever cohort
 runs first absorbs that cost, biasing a comparison unless both pay it before being measured. A
 failed warmup halts the run entirely (see above).
 
 Warmup rows are written with `"warmup": true` and no `pair_id`; `N` is recorded in
-`cli_options.warmup`. They are excluded from `run`'s summary, exit code, and every `compare`
-calculation. **Recommendation:** even with warmups, interleave baseline and treatment runs in time
-- a warmup removes the cache-cost bias but not other time-of-day or infrastructure drift.
+`cli_options.warmup`. Completed warmup rows are excluded from `run`'s summary and from every
+`compare` calculation; a failed warmup stops `run` with exit code 3. Even with warmups, interleave baseline and treatment runs in time: a warmup removes
+the cache-cost bias, not time-of-day or infrastructure drift. evalfloor does not schedule or
+enforce the interleaving.
 
 ## Cohort directory layout
 
@@ -148,7 +157,7 @@ Each `run` invocation writes to `results/runs/<run_id>/`:
   file, kept for manual inspection; the harness itself does not score output).
 
 `run_id` defaults to a generated UUID4, overridable with `--run-id`, which must match
-`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and resolve to a direct child of `results/runs/` - rejecting
+`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and resolve to a direct child of `results/runs/`, rejecting
 path traversal (e.g. `../escaped`, `a/b`, `..`) before anything is created.
 
 ## Manifest fields
@@ -156,7 +165,7 @@ path traversal (e.g. `../escaped`, `a/b`, `..`) before anything is created.
 `schema_version`, `run_id`, `created_utc`, `model`, `variant`, `task_path` (resolved),
 `task_sha256`, `agents_sha256` (or null), `system_prompt_sha256` (or null), `cwd` (resolved),
 `cwd_tree_sha256` and `cwd_tree_policy` (see below), `claude_version` (`claude --version` output, or
-`"unavailable:<reason>"` - never crashes the run), `runner_sha256` (SHA-256 of `run_eval.py`, so a
+`"unavailable:<reason>"`; never crashes the run), `runner_sha256` (SHA-256 of `run_eval.py`, so a
 compare across a changed runner is rejected), `pair_id` (or null), and `cli_options`
 (behaviour-affecting CLI values, including `warmup`).
 
@@ -187,7 +196,7 @@ behaviour.
 ## Metrics
 
 Tracked for both `run` summaries and `compare`: `tool_calls_total`, `subagents`, `num_turns`,
-`output_tokens`, `cost_usd`, `duration_ms`, `permission_denials`, `tool_errors` - exactly what
+`output_tokens`, `cost_usd`, `duration_ms`, `permission_denials`, `tool_errors`: exactly what
 `run_once()` extracts from the stream's final `result` record, its `tool_use` blocks, and its
 `tool_result` blocks marked `is_error` (`tool_errors` counts failed tool calls, permission denials
 included). Input and cache token counts are kept on every completed row (timed-out or result-less
@@ -206,13 +215,19 @@ Per metric, `compare` reports a **direction-neutral** result: `DECREASED`, `INCR
 completed rows for it (default 6, at least 5). Above that floor, the two modes decide differently.
 
 **Independent mode** uses the 95% bootstrap CI of the (treatment - baseline) **median** delta:
-`INCONCLUSIVE` if the CI includes 0, `DECREASED`/`INCREASED` if wholly below/above - unchanged.
+`INCONCLUSIVE` if the CI includes 0, `DECREASED`/`INCREASED` if it lies wholly below/above 0.
 
-**Paired mode** decides differently. A Haiku A/A smoke run (two identical cohorts, same task,
-`--pair-id`) found the percentile bootstrap CI anti-conservative for a false-positive ("A/A")
-comparison, worse in paired mode. Measured false-PASS rate over 4,000 simulations on a cost
-distribution calibrated to an early small Sonnet measurement (mean 0.613, CV 0.22), 1,000
-bootstrap resamples. Monte Carlo standard error is about 0.0035 at a 5% rate:
+**Paired mode** uses `signflip_pvalue()`: a two-sided sign-flip permutation test of the **mean**
+paired difference, exact for n <= 16 (all 2^n sign patterns enumerated) and seeded Monte Carlo
+with 20,000 permutations above that (the observed pattern is counted, so p is never 0). The result
+is `DECREASED`/`INCREASED` only when p < 0.05, with the direction taken from the sign of the mean
+difference; otherwise `INCONCLUSIVE`. The paired bootstrap CI is reported but does not decide.
+
+The reason is calibration. In A/A comparisons (both arms drawn from the same distribution, so any
+declared difference is false), the percentile bootstrap declared a difference too often, most of
+all in paired mode; an exploratory Claude Haiku A/A run showed the same. False-positive rate over 4,000
+simulations of a cost distribution calibrated to an early Sonnet measurement (mean 0.613, CV
+0.22), 1,000 bootstrap resamples; Monte Carlo standard error about 0.0035 at a 5% rate:
 
 | n per arm | bootstrap independent | bootstrap paired | exact sign-flip (paired) |
 |---:|---:|---:|---:|
@@ -221,31 +236,22 @@ bootstrap resamples. Monte Carlo standard error is about 0.0035 at a 5% rate:
 | 10 | 0.038 | 0.098 | 0.052 |
 | 20 | 0.037 | 0.083 | 0.058 |
 
-The sign-flip 0.058 at n = 20 is about two standard errors above 0.05. Two further seeds gave
-0.0465 and 0.0493 (4,000 simulations each), so it is read as seed variation, not as an
-anti-conservative test.
+The sign-flip 0.058 at n = 20 is about two standard errors above 0.05; two further seeds gave
+0.0465 and 0.0493 (4,000 simulations each), so it is treated as seed variation. `python
+docs/simulate_aa.py` reproduces the table; `docs/MEASUREMENTS.md` gives the earlier figures.
 
-(Current code: the paired bootstrap resamples the mean paired difference. Reproduce with
-`python docs/simulate_aa.py`; `docs/MEASUREMENTS.md` also gives the first, median-based figures.)
+The sign-flip test cannot reach p < 0.05 below n = 6 (the smallest two-sided p is 2/2^n: 0.03125
+at n = 6, 0.0625 at n = 5). A paired metric with fewer than 6 pairs is therefore always
+`INCONCLUSIVE`, whatever `--min-n` or the effect size. Pairs with a zero difference carry no sign
+and are dropped inside the test, so the smallest reachable p depends on the number of non-zero
+differences, which can be fewer than the number of pairs. This is also why `--min-n` defaults to 6
+with a hard floor of 5 (argument error below): 5 is where the independent bootstrap's A/A rate
+(0.030) first becomes acceptable (0.098 at n = 3).
 
-So **paired mode does not use the bootstrap CI to decide the per-metric result.** It uses
-`signflip_pvalue()` instead: an exact two-sided sign-flip permutation test of the **mean** paired
-difference (full enumeration of all 2**n sign patterns for n <= 16; seeded Monte Carlo with 20,000
-permutations above that, counting the observed pattern so p is never 0). `DECREASED`/`INCREASED`
-only when p < 0.05, direction from the sign of the mean difference; otherwise `INCONCLUSIVE`. The
-bootstrap CI is still reported in paired mode but is descriptive only there.
-
-The exact test cannot reach p < 0.05 below n = 6 (min achievable two-sided p = 2/2**n: 0.03125 at
-n=6, 0.0625 at n=5 - never below 0.05). A paired metric with fewer than 6 pairs is therefore always
-`INCONCLUSIVE`, regardless of `--min-n` or effect size. This is also why `--min-n` defaults to 6
-with a hard floor of 5 (argument error below): 5 is where the independent bootstrap's own A/A rate
-(0.033) first becomes acceptable (3 measured 0.120).
-
-Every metric's result also carries an `estimand`: `"mean_paired_difference"` in paired mode,
-`"median_difference"` independent. Paired `delta` is the mean of the paired diffs, and its
-bootstrap CI now resamples that same mean (not the median, as before) - the CI and the point
-estimate must describe the same quantity. The paired PASS/FAIL/INCONCLUSIVE decision still comes
-from the exact sign-flip test above, never from the CI.
+Every metric's result carries an `estimand`: `"mean_paired_difference"` in paired mode,
+`"median_difference"` in independent mode. Paired `delta` is the mean of the paired differences,
+and its bootstrap CI resamples the same mean, so the interval and the point estimate describe the
+same quantity. The paired decision still comes from the sign-flip test, never from the CI.
 
 `--primary METRIC:decrease|increase` declares the one metric and direction that determines the
 verdict. `--guardrail METRIC:increase|decrease` (repeatable) declares an adverse direction to fail
@@ -261,7 +267,7 @@ Overall verdict (a metric's move is CI-supported in independent mode, p-value-su
 - **INCONCLUSIVE** - everything else (including the primary being `INCONCLUSIVE`, too few
   completed/paired rows, or `--allow-failed-runs` capping a would-be PASS).
 
-"Better" and "worse" are not built into any metric - they are a policy the user declares through
+"Better" and "worse" are not built into any metric; they are a policy the user declares through
 `--primary`/`--guardrail`. Fewer tool calls in a code review, for example, could mean less
 thorough work, not a win.
 
@@ -271,14 +277,14 @@ The CI is a 95% percentile bootstrap, using `random.Random(seed)` (default seed 
 configurable resample count (`--bootstrap`, default 10000, must be >= 1000). If every completed
 row in both arms carries a non-null `pair_id`, unique within its arm and matching 1:1 across arms
 (two cohorts run with the same `--pair-id` and `--repeat`), `compare` uses **paired** resampling of
-the paired differences (of their mean - see `estimand` above); otherwise **independent** resampling
+the paired differences (of their mean; see `estimand` above); otherwise **independent** resampling
 with replacement within each arm (of the median). Running `compare` twice with the same seed and
 inputs produces byte-identical JSON.
 
 `compare` also reports, per metric, the **baseline arm's CV** (`planning_cv`; pooling both arms
 would count a real difference as noise) and a normal-approximation **planning** estimate of the
 n-per-arm needed to detect `--effect` (default 0.20, must be > 0) at alpha=0.05/power=0.80:
-`n_per_arm = ceil(2 * (z_(1-alpha/2)+z_power)^2 * CV^2 / effect^2)` - a planning heuristic, not a
+`n_per_arm = ceil(2 * (z_(1-alpha/2)+z_power)^2 * CV^2 / effect^2)`, a planning heuristic, not a
 power guarantee or a verdict input. `p_value` is the sign-flip result in paired mode, `null`
 independent (CI alone decides).
 
@@ -289,7 +295,7 @@ independent (CI alone decides).
 | 0 | `run`: every row completed. `compare`: valid comparison, verdict PASS. |
 | 1 | `compare`: valid comparison, verdict INCONCLUSIVE (also: `--allow-failed-runs` capped a would-be PASS to INCONCLUSIVE). |
 | 2 | Argument/input/validation error (bad CLI args, bad task path, malformed `--primary`/`--guardrail` spec, `--bootstrap` < 1000, `--out` not the run's own path, duplicate `--run-id`, or `--run-id` failing its pattern/traversal check). |
-| 3 | `run`: one or more measured rows failed, or a warmup run failed (which now stops before any measured run executes). |
+| 3 | `run`: one or more measured rows failed, or a warmup run failed (which stops before any measured run executes). |
 | 4 | `compare`: cohort mismatch or invalid/incomplete manifest; also an unverified/mismatched `cwd_tree_sha256` (unless `--allow-unverified-cwd` with equal `cwd` paths), a failed measured row without `--allow-failed-runs`, or invalid pairing (`pairing_invalid`: a manifest `pair_id` on one side without a matching, fully-pairable counterpart on the other). |
 | 5 | Internal/unexpected error. |
 | 6 | `compare`: valid comparison, verdict FAIL (still possible even with `--allow-failed-runs`). |
@@ -308,7 +314,7 @@ fallback, never a silent pass). **Pairing validity** is checked next: if either 
 non-null `pair_id`, both must have the *same* `pair_id` and the measured completed rows must
 satisfy full 1:1 pairing, or `compare` refuses with `"error": "pairing_invalid"`, exit 4, instead
 of silently falling back to independent-mode analysis (cohorts with no `pair_id` on either side are
-unaffected). **Failed measured runs** are checked last, before any metric is computed - see
+unaffected). **Failed measured runs** are checked last, before any metric is computed; see
 "Failed runs and warmup failures" above.
 
 ## Limitations
@@ -330,6 +336,12 @@ unaffected). **Failed measured runs** are checked last, before any metric is com
   between arms; any of those changing means a fresh baseline.
 - Metric direction (decrease/increase is "good") is a user-declared policy via
   `--primary`/`--guardrail`, not an inherent property of the metric.
+- The sign-flip p-value is exact only under its null model: paired differences symmetric about
+  zero and exchangeable in sign. Run order that correlates with the arm (all baseline runs first,
+  then all treatment runs) can break this through time drift. Alternate or randomise the order of
+  baseline and treatment runs; evalfloor does not do it for you.
+- The A/A simulation calibrates the decision rule on one synthetic cost distribution. It is
+  evidence about that distribution, not a guarantee for every task or metric.
 
 ## Development
 
@@ -353,6 +365,6 @@ implementation. `docs/simulate_aa.py` recomputes the A/A false-positive table in
 - **`yussypu/deja`** (MIT) - variance-component decomposition, ICC, flip rate, and paired
   permutation tests for agent evals.
 
-This tool makes no novelty claim over any of them. It differs mainly in being deliberately small:
-Python standard library only, no quality judging, no ICC or variance decomposition - just isolated
-run cohorts, a bootstrap or sign-flip comparison, and a primary/guardrail verdict rule.
+This tool makes no novelty claim over any of them. Its scope is narrower: isolated run cohorts, a
+bootstrap or sign-flip comparison, and a primary/guardrail verdict rule, with no quality judging
+and no variance decomposition.

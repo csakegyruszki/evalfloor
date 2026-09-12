@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.2 - 2026-09-12
+
+Documentation only; no change to `run_eval.py` or the tests.
+
+- README corrections: `--repeat` defaults to 1 (the text implied repeated runs by default); the
+  6-run minimum applies to paired comparisons, while independent mode accepts `--min-n 5`; a failed
+  warmup does affect the exit code (3), only completed warmup rows are excluded. The `--min-n`
+  rationale now quotes the 4,000-simulation figures (0.030 at n = 5, 0.098 at n = 3).
+- README additions: a Requirements section (Claude Code CLI signed in; every run is billed); the
+  sign-flip test's assumptions (symmetric, sign-exchangeable differences; alternate or randomise
+  run order) and the effect of zero differences; the A/A simulation's scope.
+- README reorganised and tightened: the paired-mode rule is stated before its rationale, and
+  history ("now", "previously") moved out of the reference text.
+
 ## 0.1.1 - 2026-09-12
 
 No change to `run_eval.py` or the tests.
