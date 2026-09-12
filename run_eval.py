@@ -19,7 +19,7 @@ and exit codes.
 """
 from __future__ import annotations
 
-import argparse, hashlib, json, math, pathlib, random, shutil, statistics, subprocess, sys, time, uuid
+import argparse, hashlib, json, math, os, pathlib, random, re, shutil, statistics, subprocess, sys, time, uuid
 from collections import Counter
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -47,9 +47,27 @@ DEFAULT_MC_PERMS = 20000  # signflip_pvalue Monte Carlo sample count above n=16
 Z_SUM = 2.801585  # z_(1-alpha/2)+z_power, alpha=0.05 two-sided, power=0.80
 
 # Exit codes (README.md keeps this in sync): 0 run-ok/compare-PASS, 1 compare-INCONCLUSIVE,
-# 2 arg/validation error, 3 run-had-failures, 4 compare-cohort-mismatch, 5 internal, 6 compare-FAIL.
+# 2 arg/validation error, 3 run-had-failures, 4 compare-cohort-mismatch (also: failed measured
+# runs without --allow-failed-runs, invalid pairing, unverified/mismatched cwd tree), 5 internal,
+# 6 compare-FAIL.
 EXIT_OK, EXIT_INCONCLUSIVE, EXIT_ARG_ERROR = 0, 1, 2
 EXIT_RUN_FAILED, EXIT_COHORT_MISMATCH, EXIT_INTERNAL, EXIT_FAIL = 3, 4, 5, 6
+
+# Guardrails on these metrics fire on ANY adverse mean move, regardless of statistical
+# significance (P0-2): a treatment that trades cost for even a slight increase in denials or
+# tool errors should never pass just because n is small or the effect isn't "significant".
+ZERO_TOLERANCE_METRICS = ("permission_denials", "tool_errors")
+
+# cwd_tree_sha256: directories skipped when walking the working tree, and size limits above
+# which the hash is not computed at all (too slow / not meant for huge trees).
+CWD_TREE_SKIP_DIRS = (".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+                      ".venv", "venv", "env", ".tox", "node_modules", "results")
+# Written to every manifest as `cwd_tree_policy`; two hashes are only comparable under the same policy.
+CWD_TREE_POLICY = "v1:" + ",".join(CWD_TREE_SKIP_DIRS)
+CWD_TREE_MAX_FILES = 5000
+CWD_TREE_MAX_BYTES = 100 * 1024 * 1024
+
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 def run_once(prompt: str, model: str, cwd: pathlib.Path, agents_json: str | None,
              timeout_s: int, system_prompt_file: str | None = None) -> dict:
@@ -151,13 +169,51 @@ def resolve_claude_version() -> str:
     except Exception as e:
         return f"unavailable:{e}"
 
+def compute_cwd_tree_sha256(cwd) -> str:
+    """Content identity of the working tree under CWD_TREE_POLICY, so the evaluated tree, not the
+    `cwd` path string, is part of cohort identity. Entries are sorted by relative POSIX path (UTF-8
+    byte order); a regular file contributes `path \\0 sha256(bytes) \\n`, a symlink
+    `path \\0 symlink:<target> \\n` and is never followed; mtime and permissions never enter the
+    hash. Directories named in CWD_TREE_SKIP_DIRS are skipped at any depth. Fails closed with
+    "unavailable:<reason>" on special files (sockets, FIFOs, devices), unreadable files, or more
+    than CWD_TREE_MAX_FILES entries / CWD_TREE_MAX_BYTES bytes. Never raises."""
+    try:
+        root = pathlib.Path(cwd)
+        entries, total_size = [], 0
+        for dirpath, dirs, files in os.walk(root, followlinks=False):
+            descend = []
+            for d in dirs:
+                if d in CWD_TREE_SKIP_DIRS: continue
+                (files if (pathlib.Path(dirpath) / d).is_symlink() else descend).append(d)
+            dirs[:] = descend  # a symlinked directory is recorded as a link, never entered
+            for name in files:
+                path = pathlib.Path(dirpath) / name
+                rel = path.relative_to(root).as_posix()
+                if path.is_symlink():
+                    entries.append((rel, "symlink:" + os.readlink(path)))
+                elif path.is_file():
+                    total_size += path.stat().st_size
+                    if total_size > CWD_TREE_MAX_BYTES: return "unavailable:too_large"
+                    entries.append((rel, sha256_file(path)))
+                else:
+                    return f"unavailable:special_file:{rel}"
+                if len(entries) > CWD_TREE_MAX_FILES: return "unavailable:too_large"
+        entries.sort(key=lambda e: e[0].encode("utf-8"))
+        h = hashlib.sha256()
+        for rel, value in entries:
+            h.update(rel.encode("utf-8") + b"\0" + value.encode("utf-8") + b"\n")
+        return h.hexdigest()
+    except Exception as e:  # unreadable file, permission error, broken path: fail closed
+        return f"unavailable:{type(e).__name__}"
+
 def build_manifest(run_id, model, variant, task_path, agents_sha256, system_prompt_sha256,
-                    cwd, pair_id, cli_options) -> dict:
+                    cwd, pair_id, cli_options, cwd_tree_sha256) -> dict:
     return {"schema_version": SCHEMA_VERSION, "run_id": run_id,
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "model": model, "variant": variant, "task_path": str(task_path),
             "task_sha256": sha256_file(task_path), "agents_sha256": agents_sha256,
             "system_prompt_sha256": system_prompt_sha256, "cwd": str(cwd),
+            "cwd_tree_sha256": cwd_tree_sha256, "cwd_tree_policy": CWD_TREE_POLICY,
             "claude_version": resolve_claude_version(),
             "runner_sha256": sha256_file(pathlib.Path(__file__).resolve()),
             "pair_id": pair_id, "cli_options": cli_options}
@@ -194,7 +250,11 @@ def cmd_run(args) -> int:
     system_prompt_sha = sha256_file(sp_path) if sp_path else None
     cwd = pathlib.Path(args.cwd).resolve() if args.cwd else task_path.parent
     run_id = args.run_id or str(uuid.uuid4())
-    run_dir = RUNS_DIR / run_id
+    if not RUN_ID_RE.match(run_id):
+        print(f"ERROR: --run-id must match {RUN_ID_RE.pattern}: {run_id}", file=sys.stderr); return EXIT_ARG_ERROR
+    run_dir = (RUNS_DIR / run_id).resolve()
+    if run_dir.parent != RUNS_DIR.resolve():  # P1-c: reject path traversal (e.g. "../escaped", "a/b") before creating anything
+        print(f"ERROR: --run-id must resolve to a direct child of {RUNS_DIR}: {run_id}", file=sys.stderr); return EXIT_ARG_ERROR
     try:
         run_dir.mkdir(parents=True, exist_ok=False)
     except FileExistsError:
@@ -206,8 +266,9 @@ def cmd_run(args) -> int:
     cli_options = {"model": args.model, "variant": args.variant, "task": str(task_path), "repeat": args.repeat,
                    "timeout": args.timeout, "agents": args.agents, "system_prompt_file": args.system_prompt_file,
                    "cwd": str(cwd), "warmup": args.warmup}
+    cwd_tree_sha = compute_cwd_tree_sha256(cwd)  # computed before the first run (P1-a)
     manifest = build_manifest(run_id, args.model, args.variant, task_path, agents_sha, system_prompt_sha,
-                               cwd, args.pair_id, cli_options)
+                               cwd, args.pair_id, cli_options, cwd_tree_sha)
     try:
         with manifest_path.open("x", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2, sort_keys=True)
@@ -239,7 +300,13 @@ def cmd_run(args) -> int:
         return row
 
     for i in range(1, args.warmup + 1):
-        do_one(i, args.warmup, "warmup", True, "warmup")
+        warmup_row = do_one(i, args.warmup, "warmup", True, "warmup")
+        if not is_completed_row(warmup_row):
+            # P0-3: a failed warmup stops before any measured run - the manifest and the failed
+            # warmup row stay on disk (already written above) for inspection.
+            print(f"ERROR: warmup run {i}/{args.warmup} failed: {warmup_row.get('error', 'not completed')}",
+                  file=sys.stderr)
+            return EXIT_RUN_FAILED
     rows = [do_one(i, args.repeat, "run", False, "run") for i in range(1, args.repeat + 1)]
     summary = summarize(rows)
     print(f"\n=== summary ({args.variant}) ===")
@@ -269,14 +336,27 @@ def load_cohort(run_dir) -> tuple:
             raise ValueError(f"malformed metrics.jsonl line {line_no} in {run_dir}: {e}")
     return manifest, rows
 
-def validate_comparable_cohorts(base_manifest, treat_manifest, base_rows, treat_rows) -> list:
+def validate_comparable_cohorts(base_manifest, treat_manifest, base_rows, treat_rows,
+                                 allow_unverified_cwd=False) -> list:
     """List of mismatched field names; empty means comparable."""
-    identity = ("schema_version", "task_sha256", "model", "claude_version", "runner_sha256")
+    identity = ("schema_version", "task_sha256", "model", "claude_version", "runner_sha256", "cwd_tree_policy")
     # A field missing from both manifests would compare equal (None == None), so absence is itself a mismatch.
     mismatches = [f for f in identity if base_manifest.get(f) is None or treat_manifest.get(f) is None
                   or base_manifest.get(f) != treat_manifest.get(f)]
     if any(str(m.get("claude_version", "")).startswith("unavailable:") for m in (base_manifest, treat_manifest)):
         mismatches.append("claude_version_unavailable")
+    # P1-a: cwd_tree_sha256 is part of cohort identity (the `cwd` string alone is not - two
+    # different checkouts of the same tree must compare as identical). An "unavailable:..."
+    # value on either side is rejected unless --allow-unverified-cwd is given, in which case the
+    # two manifests' `cwd` paths must be equal instead.
+    base_tree, treat_tree = base_manifest.get("cwd_tree_sha256"), treat_manifest.get("cwd_tree_sha256")
+    unverified = (base_tree is None or str(base_tree).startswith("unavailable:")
+                  or treat_tree is None or str(treat_tree).startswith("unavailable:"))
+    if unverified:
+        if not allow_unverified_cwd or base_manifest.get("cwd") != treat_manifest.get("cwd"):
+            mismatches.append("cwd_tree_sha256")
+    elif base_tree != treat_tree:
+        mismatches.append("cwd_tree_sha256")
     if base_manifest.get("variant") == treat_manifest.get("variant"): mismatches.append("variant_not_distinct")
     for label, manifest, rows in (("baseline", base_manifest, base_rows), ("treatment", treat_manifest, treat_rows)):
         ids = [r.get("session_id") for r in rows]
@@ -303,13 +383,17 @@ def pair_diffs(name: str, base_rows: list, treat_rows: list):
     return [treat_map[k] - base_map[k] for k in sorted(common, key=str)]
 
 def bootstrap_delta_ci(base_vals, treat_vals, seed: int, resamples: int, paired_diffs=None) -> tuple:
-    """95% percentile bootstrap CI of the delta via random.Random(seed) - deterministic for a fixed seed. Paired mode resamples paired diffs; independent mode resamples each arm with replacement."""
+    """95% percentile bootstrap CI of the delta via random.Random(seed) - deterministic for a fixed
+    seed. Paired mode resamples the MEAN of the paired diffs (P2: matches the reported point
+    estimate, which is also the mean - a median-of-resamples CI was answering a different
+    question than the delta it was attached to). Independent mode resamples each arm with
+    replacement and reports the median delta, unchanged."""
     rnd = random.Random(seed)
     deltas = []
     if paired_diffs is not None:
         n = len(paired_diffs)
         for _ in range(resamples):
-            deltas.append(statistics.median([paired_diffs[rnd.randrange(n)] for _ in range(n)]))
+            deltas.append(statistics.fmean([paired_diffs[rnd.randrange(n)] for _ in range(n)]))
     else:
         nb, nt = len(base_vals), len(treat_vals)
         for _ in range(resamples):
@@ -359,19 +443,22 @@ def compare_metric(name, base_rows, treat_rows, min_n, seed, resamples, effect, 
     base_vals = [r[name] for r in base_rows if isinstance(r.get(name), (int, float))]
     treat_vals = [r[name] for r in treat_rows if isinstance(r.get(name), (int, float))]
     def arm(vals):
-        if not vals: return {"n": 0, "median": None, "stdev": None, "cv": None}
+        if not vals: return {"n": 0, "mean": None, "median": None, "stdev": None, "cv": None}
         mean, sd = statistics.fmean(vals), (statistics.stdev(vals) if len(vals) >= 2 else None)
-        return {"n": len(vals), "median": statistics.median(vals), "stdev": sd,
+        return {"n": len(vals), "mean": mean, "median": statistics.median(vals), "stdev": sd,
                 "cv": (sd / mean) if sd is not None and mean != 0 else None}
     base_desc, treat_desc = arm(base_vals), arm(treat_vals)
     # Planning estimate from the BASELINE arm's CV: pooling both arms would fold a real shift into the noise.
     pcv = base_desc["cv"]
     n_needed = None if pcv is None else max(2, math.ceil(2 * Z_SUM * Z_SUM * pcv * pcv / (effect * effect)))
+    diffs = pair_diffs(name, base_rows, treat_rows) if paired else None
+    # P2: the estimand is declared regardless of the min_n gate below, so a caller can always see
+    # which quantity this metric's delta/CI answer for - mean of paired diffs, or median delta.
+    estimand = "mean_paired_difference" if diffs is not None else "median_difference"
     result = {"baseline": base_desc, "treatment": treat_desc, "planning_cv": pcv, "n_per_arm_for_effect": n_needed,
-              "p_value": None}
+              "p_value": None, "estimand": estimand}
     if base_desc["n"] < min_n or treat_desc["n"] < min_n:
         result.update({"delta": None, "ci_low": None, "ci_high": None, "result": "INCONCLUSIVE"}); return result
-    diffs = pair_diffs(name, base_rows, treat_rows) if paired else None
     if diffs is not None:
         lo, hi = bootstrap_delta_ci(None, None, seed, resamples, paired_diffs=diffs)
         delta = statistics.fmean(diffs)
@@ -398,13 +485,28 @@ def parse_metric_direction(spec: str) -> tuple:
 
 _MOVED = {"decrease": "DECREASED", "increase": "INCREASED"}
 
+def guardrail_fired(metric, direction, metrics_report) -> tuple:
+    """(fired, rule) for one guardrail metric+direction. P0-2: a guardrail on a
+    ZERO_TOLERANCE_METRICS metric fires on ANY adverse mean move, regardless of statistical
+    significance - a treatment that trades cost for even a slight increase in denials or tool
+    errors must never pass just because n is small or the move isn't "significant". Guardrails on
+    every other metric keep the original statistical rule (the metric's own DECREASED/INCREASED
+    result, which already required significance)."""
+    res = metrics_report[metric]
+    if metric in ZERO_TOLERANCE_METRICS:
+        base_mean, treat_mean = res["baseline"]["mean"], res["treatment"]["mean"]
+        if base_mean is None or treat_mean is None: return False, "zero_tolerance"
+        fired = (treat_mean > base_mean) if direction == "increase" else (treat_mean < base_mean)
+        return fired, "zero_tolerance"
+    return res["result"] == _MOVED[direction], "statistical"
+
 def overall_verdict(metrics_report, primary_metric, primary_dir, guardrails) -> str:
-    """PASS: primary moved in its declared direction and no guardrail moved in its adverse direction.
-    FAIL: primary moved the opposite way, or a guardrail moved adversely. INCONCLUSIVE otherwise.
+    """PASS: primary moved in its declared direction and no guardrail fired (see guardrail_fired).
+    FAIL: primary moved the opposite way, or a guardrail fired. INCONCLUSIVE otherwise.
     Non-guardrail metrics never affect the verdict."""
     primary_res = metrics_report[primary_metric]["result"]
     opposite = _MOVED["increase" if primary_dir == "decrease" else "decrease"]
-    if primary_res == opposite or any(metrics_report[m]["result"] == _MOVED[d] for m, d in guardrails):
+    if primary_res == opposite or any(guardrail_fired(m, d, metrics_report)[0] for m, d in guardrails):
         return "FAIL"
     return "PASS" if primary_res == _MOVED[primary_dir] else "INCONCLUSIVE"
 
@@ -425,7 +527,8 @@ def cmd_compare(args) -> int:
         treat_manifest, treat_rows = load_cohort(args.treatment)
     except ValueError as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr); return EXIT_COHORT_MISMATCH
-    mismatches = validate_comparable_cohorts(base_manifest, treat_manifest, base_rows, treat_rows)
+    mismatches = validate_comparable_cohorts(base_manifest, treat_manifest, base_rows, treat_rows,
+                                              args.allow_unverified_cwd)
     if mismatches:
         report = {"error": "cohort_mismatch", "fields": mismatches}
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -433,15 +536,56 @@ def cmd_compare(args) -> int:
         return EXIT_COHORT_MISMATCH
     base_completed = [r for r in base_rows if is_completed_row(r) and not r.get("warmup")]
     treat_completed = [r for r in treat_rows if is_completed_row(r) and not r.get("warmup")]
+    # P0-1: a failed MEASURED row (warmup rows excluded) in either cohort makes the comparison
+    # invalid by default - silently dropping it would introduce selection bias (the cohort that
+    # kept fewer/easier runs looks artificially better). --allow-failed-runs opts back in, but
+    # then the verdict can never be PASS.
+    base_failed = [r for r in base_rows if not r.get("warmup") and not is_completed_row(r)]
+    treat_failed = [r for r in treat_rows if not r.get("warmup") and not is_completed_row(r)]
+    if (base_failed or treat_failed) and not args.allow_failed_runs:
+        report = {"error": "failed_runs", "validity": "INVALID_FAILED_RUNS",
+                  "failed_baseline": len(base_failed), "failed_treatment": len(treat_failed)}
+        print(json.dumps(report, indent=2, sort_keys=True))
+        if args.report: write_json_atomic(args.report, report)
+        return EXIT_COHORT_MISMATCH
+    # P1-b: a manifest-level pair_id on either side commits both cohorts to paired analysis - if
+    # they don't actually agree (same pair_id, and every measured completed row pairs up 1:1),
+    # that is a broken experiment design, not something to silently fall back to independent mode for.
+    base_pair_id, treat_pair_id = base_manifest.get("pair_id"), treat_manifest.get("pair_id")
+    if base_pair_id is not None or treat_pair_id is not None:
+        if base_pair_id != treat_pair_id or not cohort_is_paired(base_completed, treat_completed):
+            report = {"error": "pairing_invalid", "baseline_pair_id": base_pair_id, "treatment_pair_id": treat_pair_id}
+            print(json.dumps(report, indent=2, sort_keys=True))
+            if args.report: write_json_atomic(args.report, report)
+            return EXIT_COHORT_MISMATCH
     paired = cohort_is_paired(base_completed, treat_completed)
     metrics_report = {m: compare_metric(m, base_completed, treat_completed, args.min_n, args.seed,
                                          args.bootstrap, args.effect, paired) for m in METRICS}
     verdict = overall_verdict(metrics_report, primary_metric, primary_dir, guardrails)
+    if (base_failed or treat_failed) and verdict == "PASS":
+        verdict = "INCONCLUSIVE"  # --allow-failed-runs: failed measured runs cap the verdict, PASS is never allowed
+    def total(rows, metric):
+        return sum(r[metric] for r in rows if isinstance(r.get(metric), (int, float)))
+    # Zero-tolerance guardrails are deterministic policy checks, not inference: with equal measured run
+    # counts, any increase of the aggregate count fails (equivalent to the per-run mean compared in
+    # guardrail_fired); with unequal counts (only possible with --allow-failed-runs or unequal --repeat)
+    # the per-run mean is the basis, and the report says so.
+    guardrails_detail = []
+    for m, d in guardrails:
+        fired, rule = guardrail_fired(m, d, metrics_report)
+        bt, tt = total(base_completed, m), total(treat_completed, m)
+        guardrails_detail.append({
+            "metric": m, "direction": d, "rule": rule, "fired": fired,
+            "baseline_total": bt, "treatment_total": tt, "delta_total": tt - bt,
+            "baseline_n": len(base_completed), "treatment_n": len(treat_completed),
+            "basis": "aggregate_count" if len(base_completed) == len(treat_completed) else "per_run_mean"})
     report = {"baseline_run_id": base_manifest.get("run_id"), "treatment_run_id": treat_manifest.get("run_id"),
               "baseline_variant": base_manifest.get("variant"), "treatment_variant": treat_manifest.get("variant"),
               "paired": paired, "primary": f"{primary_metric}:{primary_dir}",
-              "guardrails": [f"{m}:{d}" for m, d in guardrails],
+              "guardrails": [f"{m}:{d}" for m, d in guardrails], "guardrails_detail": guardrails_detail,
               "seed": args.seed, "bootstrap": args.bootstrap, "min_n": args.min_n, "effect": args.effect,
+              "validity": "DEGRADED_FAILED_RUNS" if (base_failed or treat_failed) else "VALID",
+              "failed_baseline": len(base_failed), "failed_treatment": len(treat_failed),
               "metrics": metrics_report, "verdict": verdict}
     print(json.dumps(report, indent=2, sort_keys=True))
     if args.report: write_json_atomic(args.report, report)
@@ -476,6 +620,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     cmp_p.add_argument("--min-n", type=int, default=DEFAULT_MIN_N); cmp_p.add_argument("--effect", type=float, default=DEFAULT_EFFECT)
     cmp_p.add_argument("--seed", type=int, default=DEFAULT_SEED); cmp_p.add_argument("--bootstrap", type=int, default=DEFAULT_BOOTSTRAP)
     cmp_p.add_argument("--report", default=None, help="optional path to also write the JSON report")
+    cmp_p.add_argument("--allow-failed-runs", action="store_true",
+                        help="proceed despite failed measured rows in either cohort; caps the verdict at INCONCLUSIVE (never PASS)")
+    cmp_p.add_argument("--allow-unverified-cwd", action="store_true",
+                        help="accept an 'unavailable:...' cwd_tree_sha256 if both manifests' --cwd paths are equal")
     return ap
 
 def main(argv=None) -> int:

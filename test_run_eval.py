@@ -49,14 +49,19 @@ class HarnessTestCase(unittest.TestCase):
         return task
 
     def write_cohort(self, run_id, variant, rows, model="m1", task_sha="task-sha",
-                      claude_version="v1", runner_sha="runner-sha", pair_id=None):
-        """Write a manifest.json + metrics.jsonl directly, bypassing cmd_run (for compare tests)."""
+                      claude_version="v1", runner_sha="runner-sha", pair_id=None,
+                      cwd_tree_sha256="tree-sha", cwd=None):
+        """Write a manifest.json + metrics.jsonl directly, bypassing cmd_run (for compare tests).
+        cwd_tree_sha256 defaults to the same value on every call so unrelated tests stay
+        comparable without having to know about P1-a."""
         run_dir = ev.RUNS_DIR / run_id
         run_dir.mkdir(parents=True)
         manifest = {"schema_version": ev.SCHEMA_VERSION, "run_id": run_id,
                     "created_utc": "2026-01-01T00:00:00Z", "model": model, "variant": variant,
                     "task_path": "task.md", "task_sha256": task_sha, "agents_sha256": None,
-                    "system_prompt_sha256": None, "cwd": str(self.tmp), "claude_version": claude_version,
+                    "system_prompt_sha256": None, "cwd": cwd if cwd is not None else str(self.tmp),
+                    "cwd_tree_sha256": cwd_tree_sha256, "cwd_tree_policy": ev.CWD_TREE_POLICY,
+                    "claude_version": claude_version,
                     "runner_sha256": runner_sha, "pair_id": pair_id, "cli_options": {}}
         (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         with (run_dir / "metrics.jsonl").open("w", encoding="utf-8") as fh:
@@ -321,7 +326,11 @@ class TestWarmup(HarnessTestCase):
         manifest = json.loads((ev.RUNS_DIR / "wu" / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["cli_options"]["warmup"], 2)
 
-    def test_default_warmup_is_one_and_excluded_from_summary_and_exit_code(self):
+    def test_default_warmup_is_one_and_a_failed_warmup_stops_before_measured_runs(self):
+        """P0-3: behaviour changed intentionally. A failed warmup used to be silently ignored
+        (all measured runs still executed, exit code EXIT_OK). Now a failed warmup stops the run
+        BEFORE any measured run executes and returns EXIT_RUN_FAILED; the manifest and the failed
+        warmup row stay on disk for inspection."""
         calls = []
 
         def fake_run_once(prompt, model, cwd, agents_json, timeout_s, system_prompt_file=None):
@@ -332,9 +341,13 @@ class TestWarmup(HarnessTestCase):
 
         self.patch_run_once(fake_run_once)
         task = self.make_task()
-        rc = ev.main(["run", "--task", str(task), "--variant", "a", "--repeat", "3", "--model", "m1", "--run-id", "wd"])
-        self.assertEqual(len(calls), 4)  # default warmup=1 + 3 measured
-        self.assertEqual(rc, ev.EXIT_OK)  # the failed warmup row must not affect the exit code
+        rc = ev.main(["run", "--task", str(task), "--variant", "a", "--repeat", "2", "--model", "m1", "--run-id", "wd"])
+        self.assertEqual(len(calls), 1)  # stopped before any measured run
+        self.assertEqual(rc, ev.EXIT_RUN_FAILED)
+        rows = [json.loads(l) for l in (ev.RUNS_DIR / "wd" / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(rows), 1)  # the failed warmup row stays on disk
+        self.assertTrue(rows[0]["warmup"])
+        self.assertTrue((ev.RUNS_DIR / "wd" / "manifest.json").exists())  # the manifest stays on disk too
 
     def test_warmup_rows_excluded_from_compare(self):
         rows_a = [make_row(f"a{i}", cost_usd=0.5, pair_id=f"p{i}", warmup=False) for i in range(6)]
@@ -606,6 +619,291 @@ class TestAuditFixes(HarnessTestCase):
         base, treat = self._cohorts()
         for bad in ("nan", "inf", "-1"):
             self.assertEqual(self._cmp(base, treat, "--effect", bad), ev.EXIT_ARG_ERROR)
+
+class TestFailedRunInvalidation(HarnessTestCase):
+    """P0-1: a failed MEASURED row in either cohort must invalidate the comparison by default
+    (selection bias otherwise: the cohort that kept fewer/harder runs looks artificially better)."""
+
+    def _cohorts_with_failures(self):
+        base_rows = [make_row(f"b{i}", cost_usd=1.0) for i in range(10)]
+        treat_rows = ([make_row(f"t{i}", cost_usd=0.10) for i in range(6)] +
+                      [{"session_id": f"tf{i}", "error": "timeout"} for i in range(4)])
+        base = self.write_cohort("base", "baseline", base_rows)
+        treat = self.write_cohort("treat", "treatment", treat_rows)
+        return base, treat
+
+    def test_failed_measured_runs_invalidate_comparison_by_default(self):
+        base, treat = self._cohorts_with_failures()
+        report_path = self.tmp / "report.json"
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat),
+                      "--primary", "cost_usd:decrease", "--report", str(report_path)])
+        self.assertEqual(rc, ev.EXIT_COHORT_MISMATCH)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["error"], "failed_runs")
+        self.assertEqual(report["failed_treatment"], 4)
+        self.assertEqual(report["failed_baseline"], 0)
+
+    def test_allow_failed_runs_proceeds_and_caps_at_inconclusive(self):
+        base, treat = self._cohorts_with_failures()
+        report_path = self.tmp / "report.json"
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat), "--primary", "cost_usd:decrease",
+                      "--report", str(report_path), "--allow-failed-runs"])
+        self.assertEqual(rc, ev.EXIT_INCONCLUSIVE)  # a clear cost win would otherwise PASS - capped
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["verdict"], "INCONCLUSIVE")
+        self.assertEqual(report["failed_treatment"], 4)
+        self.assertEqual(report["failed_baseline"], 0)
+
+    def test_allow_failed_runs_still_allows_fail_verdict(self):
+        base_rows = [make_row(f"b{i}", cost_usd=1.0) for i in range(10)]
+        treat_rows = ([make_row(f"t{i}", cost_usd=5.0) for i in range(6)] +
+                      [{"session_id": f"tf{i}", "error": "timeout"} for i in range(4)])
+        base = self.write_cohort("base", "baseline", base_rows)
+        treat = self.write_cohort("treat", "treatment", treat_rows)
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat),
+                      "--primary", "cost_usd:decrease", "--allow-failed-runs"])
+        self.assertEqual(rc, ev.EXIT_FAIL)  # FAIL is still allowed under --allow-failed-runs
+
+    def test_no_failed_runs_reports_zero_counts(self):
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}", cost_usd=1.0 + 0.001 * i) for i in range(8)])
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}", cost_usd=0.5 + 0.001 * i) for i in range(8)])
+        report_path = self.tmp / "report.json"
+        ev.main(["compare", "--baseline", str(base), "--treatment", str(treat),
+                 "--primary", "cost_usd:decrease", "--guardrail", "none", "--report", str(report_path)])
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["failed_baseline"], 0)
+        self.assertEqual(report["failed_treatment"], 0)
+
+class TestZeroToleranceGuardrails(HarnessTestCase):
+    """P0-2: permission_denials/tool_errors guardrails fire on any adverse mean move, regardless
+    of statistical significance - the default statistical rule was fail-open at small n."""
+
+    def test_repro_denials_fail_regardless_of_significance(self):
+        base_rows = [make_row(f"b{i}", cost_usd=1.00, permission_denials=0, pair_id=f"k:{i}") for i in range(6)]
+        treat_rows = [make_row(f"t{i}", cost_usd=0.50, permission_denials=d, pair_id=f"k:{i}")
+                      for i, d in enumerate([1, 1, 1, 1, 1, 0])]
+        base = self.write_cohort("base", "baseline", base_rows, pair_id="k")
+        treat = self.write_cohort("treat", "treatment", treat_rows, pair_id="k")
+        report_path = self.tmp / "report.json"
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat),
+                      "--primary", "cost_usd:decrease", "--report", str(report_path)])
+        self.assertEqual(rc, ev.EXIT_FAIL)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        denial_rule = next(g for g in report["guardrails_detail"] if g["metric"] == "permission_denials")
+        self.assertEqual(denial_rule["rule"], "zero_tolerance")
+        self.assertTrue(denial_rule["fired"])
+
+    def test_equal_denials_does_not_fire(self):
+        base_rows = [make_row(f"b{i}", cost_usd=1.00, permission_denials=0, pair_id=f"k:{i}") for i in range(6)]
+        treat_rows = [make_row(f"t{i}", cost_usd=0.50, permission_denials=0, pair_id=f"k:{i}") for i in range(6)]
+        base = self.write_cohort("base", "baseline", base_rows, pair_id="k")
+        treat = self.write_cohort("treat", "treatment", treat_rows, pair_id="k")
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat), "--primary", "cost_usd:decrease"])
+        self.assertEqual(rc, ev.EXIT_OK)
+
+    def test_guardrail_fired_helper_directly(self):
+        metrics_report = {"permission_denials": {"baseline": {"mean": 0.0}, "treatment": {"mean": 0.5}}}
+        fired, rule = ev.guardrail_fired("permission_denials", "increase", metrics_report)
+        self.assertTrue(fired); self.assertEqual(rule, "zero_tolerance")
+        fired, rule = ev.guardrail_fired("permission_denials", "increase",
+                                          {"permission_denials": {"baseline": {"mean": 0.5}, "treatment": {"mean": 0.5}}})
+        self.assertFalse(fired)
+
+class TestCwdTreeHash(HarnessTestCase):
+    """P1-a: cwd is not part of cohort identity by itself; the working tree's content is."""
+
+    def test_different_fixture_contents_gives_mismatch(self):
+        dir_a = self.tmp / "cwd_a"; dir_a.mkdir()
+        (dir_a / "f.py").write_text("print(1)", encoding="utf-8")
+        dir_b = self.tmp / "cwd_b"; dir_b.mkdir()
+        (dir_b / "f.py").write_text("print(2)", encoding="utf-8")
+        hash_a, hash_b = ev.compute_cwd_tree_sha256(dir_a), ev.compute_cwd_tree_sha256(dir_b)
+        self.assertNotEqual(hash_a, hash_b)
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}") for i in range(6)], cwd_tree_sha256=hash_a)
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}") for i in range(6)], cwd_tree_sha256=hash_b)
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat), "--primary", "cost_usd:decrease"])
+        self.assertEqual(rc, ev.EXIT_COHORT_MISMATCH)
+
+    def test_same_contents_in_two_different_temp_dirs_is_comparable(self):
+        dir_a = self.tmp / "cwd_a2"; dir_a.mkdir()
+        (dir_a / "f.py").write_text("print(1)", encoding="utf-8")
+        dir_b = self.tmp / "cwd_b2"; dir_b.mkdir()
+        (dir_b / "f.py").write_text("print(1)", encoding="utf-8")
+        hash_a, hash_b = ev.compute_cwd_tree_sha256(dir_a), ev.compute_cwd_tree_sha256(dir_b)
+        self.assertEqual(hash_a, hash_b)
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}") for i in range(6)], cwd_tree_sha256=hash_a)
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}") for i in range(6)], cwd_tree_sha256=hash_b)
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat), "--primary", "cost_usd:decrease"])
+        self.assertIn(rc, (ev.EXIT_OK, ev.EXIT_INCONCLUSIVE, ev.EXIT_FAIL))
+
+    def test_hash_computed_via_helper_on_small_temp_tree(self):
+        d = self.tmp / "tree"; d.mkdir()
+        (d / "a.txt").write_text("hello", encoding="utf-8")
+        sub = d / "sub"; sub.mkdir()
+        (sub / "b.txt").write_text("world", encoding="utf-8")
+        h1, h2 = ev.compute_cwd_tree_sha256(d), ev.compute_cwd_tree_sha256(d)
+        self.assertEqual(h1, h2)
+        self.assertFalse(h1.startswith("unavailable:"))
+
+    def test_p1a_repro_cwd_string_alone_is_not_identity_tree_hash_is(self):
+        """Repro: manifests identical except cwd '/one' vs '/two'. Before the fix,
+        validate_comparable_cohorts returned [] because cwd wasn't part of identity at all."""
+        base_manifest = {"schema_version": ev.SCHEMA_VERSION, "task_sha256": "t", "model": "m",
+                          "claude_version": "v1", "runner_sha256": "r", "variant": "baseline",
+                          "cwd": "/one", "cwd_tree_sha256": "hash-one", "run_id": "b"}
+        treat_manifest = dict(base_manifest, cwd="/two", cwd_tree_sha256="hash-two", variant="treatment", run_id="t")
+        mismatches = ev.validate_comparable_cohorts(base_manifest, treat_manifest, [], [])
+        self.assertIn("cwd_tree_sha256", mismatches)
+
+    def test_unavailable_cwd_hash_rejected_without_flag(self):
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}") for i in range(6)], cwd_tree_sha256="unavailable:too_large")
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}") for i in range(6)], cwd_tree_sha256="unavailable:too_large")
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat), "--primary", "cost_usd:decrease"])
+        self.assertEqual(rc, ev.EXIT_COHORT_MISMATCH)
+
+    def test_allow_unverified_cwd_passes_when_cwd_paths_equal(self):
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}") for i in range(6)], cwd_tree_sha256="unavailable:too_large")
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}") for i in range(6)], cwd_tree_sha256="unavailable:too_large")
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat),
+                      "--primary", "cost_usd:decrease", "--allow-unverified-cwd"])
+        self.assertIn(rc, (ev.EXIT_OK, ev.EXIT_INCONCLUSIVE, ev.EXIT_FAIL))
+
+    def test_allow_unverified_cwd_still_rejects_different_cwd_paths(self):
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}") for i in range(6)],
+                                  cwd_tree_sha256="unavailable:x", cwd="/one")
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}") for i in range(6)],
+                                   cwd_tree_sha256="unavailable:x", cwd="/two")
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat),
+                      "--primary", "cost_usd:decrease", "--allow-unverified-cwd"])
+        self.assertEqual(rc, ev.EXIT_COHORT_MISMATCH)
+
+class TestPairingValidity(HarnessTestCase):
+    """P1-b: a manifest-level pair_id mismatch must be an explicit error, not a silent fallback
+    to independent mode."""
+
+    def test_repro_mismatched_pair_ids_is_pairing_invalid(self):
+        base_rows = [make_row(f"b{i}", pair_id=f"k:{i}") for i in range(6)]
+        treat_rows = [make_row(f"t{i}", pair_id=f"z:{i}") for i in range(6)]
+        base = self.write_cohort("base", "baseline", base_rows, pair_id="k")
+        treat = self.write_cohort("treat", "treatment", treat_rows, pair_id="z")
+        report_path = self.tmp / "report.json"
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat),
+                      "--primary", "cost_usd:decrease", "--report", str(report_path)])
+        self.assertEqual(rc, ev.EXIT_COHORT_MISMATCH)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["error"], "pairing_invalid")
+
+    def test_no_pair_id_either_side_stays_independent(self):
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}") for i in range(6)])
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}") for i in range(6)])
+        report_path = self.tmp / "report.json"
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat),
+                      "--primary", "cost_usd:decrease", "--report", str(report_path)])
+        self.assertIn(rc, (ev.EXIT_OK, ev.EXIT_INCONCLUSIVE, ev.EXIT_FAIL))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertFalse(report["paired"])
+
+    def test_same_pair_id_but_unpairable_rows_is_pairing_invalid(self):
+        # Same manifest-level pair_id on both sides, but the per-row pair_ids don't line up 1:1.
+        base_rows = [make_row(f"b{i}", pair_id=f"k:{i}") for i in range(6)]
+        treat_rows = [make_row(f"t{i}", pair_id=f"k:{i + 100}") for i in range(6)]
+        base = self.write_cohort("base", "baseline", base_rows, pair_id="k")
+        treat = self.write_cohort("treat", "treatment", treat_rows, pair_id="k")
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat), "--primary", "cost_usd:decrease"])
+        self.assertEqual(rc, ev.EXIT_COHORT_MISMATCH)
+
+class TestRunIdValidation(HarnessTestCase):
+    """P1-c: --run-id must not allow path traversal outside RUNS_DIR."""
+
+    def test_path_traversal_run_ids_rejected_before_creating_anything(self):
+        task = self.make_task()
+        for bad in ("../escaped", "a/b", ".."):
+            rc = ev.main(["run", "--task", str(task), "--variant", "a", "--model", "m1", "--run-id", bad])
+            self.assertEqual(rc, ev.EXIT_ARG_ERROR)
+        # main() always creates RESULTS_DIR/RUNS_DIR themselves; nothing else should exist.
+        self.assertFalse((ev.RESULTS_DIR / "escaped").exists())
+        self.assertFalse((ev.RESULTS_DIR.parent / "escaped").exists())
+        self.assertEqual(list(ev.RUNS_DIR.iterdir()), [])
+
+    def test_valid_run_id_with_dots_underscore_dash_accepted(self):
+        self.patch_run_once(lambda *a, **k: make_row("s1"))
+        rc = ev.main(["run", "--task", str(self.make_task()), "--variant", "a", "--model", "m1",
+                      "--run-id", "ok-1.2_x", "--warmup", "0"])
+        self.assertEqual(rc, ev.EXIT_OK)
+        self.assertTrue((ev.RUNS_DIR / "ok-1.2_x").is_dir())
+
+class TestPairedEstimand(unittest.TestCase):
+    """P2: in paired mode the bootstrap CI must resample the MEAN of the paired diffs (matching
+    the reported delta), not the median of the paired diffs."""
+
+    def test_paired_ci_brackets_mean_not_median(self):
+        diffs = [-0.9, 0.1, 0.1, 0.1, 0.1, 0.1]  # mean and median differ substantially here
+        base = [{"cost_usd": 1.0, "pair_id": f"p{i}"} for i in range(6)]
+        treat = [{"cost_usd": 1.0 + d, "pair_id": f"p{i}"} for i, d in enumerate(diffs)]
+        res = ev.compare_metric("cost_usd", base, treat, 6, 0, 2000, 0.20, True)
+        mean_delta = sum(diffs) / len(diffs)
+        self.assertAlmostEqual(res["delta"], mean_delta)
+        self.assertLessEqual(res["ci_low"], mean_delta)
+        self.assertGreaterEqual(res["ci_high"], mean_delta)
+        self.assertEqual(res["estimand"], "mean_paired_difference")
+
+    def test_independent_mode_estimand_is_median_difference(self):
+        base = [{"cost_usd": v} for v in (1.0, 1.1, 0.9, 1.0, 1.05, 0.95)]
+        treat = [{"cost_usd": v} for v in (0.5, 0.55, 0.45, 0.5, 0.52, 0.48)]
+        res = ev.compare_metric("cost_usd", base, treat, 6, 0, 2000, 0.20, False)
+        self.assertEqual(res["estimand"], "median_difference")
+
+class TestRefinedContract(HarnessTestCase):
+    """cwd_tree_policy is an identity field; a clean compare reports VALID and auditable guardrail totals."""
+
+    def test_tree_policy_mismatch_is_rejected(self):
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}") for i in range(6)])
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}") for i in range(6)])
+        manifest = json.loads((treat / "manifest.json").read_text(encoding="utf-8"))
+        manifest["cwd_tree_policy"] = "v0:.git"
+        (treat / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat)])
+        self.assertEqual(rc, ev.EXIT_COHORT_MISMATCH)
+
+    def test_clean_compare_is_valid_with_aggregate_totals(self):
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}", cost_usd=1.0 + 0.001 * i) for i in range(6)])
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}", cost_usd=0.5 + 0.001 * i,
+                                                                  tool_errors=1 if i == 0 else 0) for i in range(6)])
+        path = self.tmp / "r.json"
+        rc = ev.main(["compare", "--baseline", str(base), "--treatment", str(treat), "--report", str(path)])
+        report = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(report["validity"], "VALID")
+        detail = {g["metric"]: g for g in report["guardrails_detail"]}
+        self.assertEqual((detail["tool_errors"]["baseline_total"], detail["tool_errors"]["treatment_total"],
+                          detail["tool_errors"]["delta_total"], detail["tool_errors"]["basis"]),
+                         (0, 1, 1, "aggregate_count"))
+        self.assertTrue(detail["tool_errors"]["fired"])
+        self.assertEqual(rc, ev.EXIT_FAIL)  # a single extra tool error fails the zero-tolerance guardrail
+
+class TestMutationSurvivors(HarnessTestCase):
+    """Closes the two survivors of the release mutation audit (paired estimand, guardrail totals)."""
+
+    def test_paired_ci_is_for_the_mean_not_the_median(self):
+        # One large negative diff and 19 zeros: mean -0.5, median 0. A median bootstrap would give [0, 0].
+        base = [{"cost_usd": 20.0, "pair_id": f"p{i}"} for i in range(20)]
+        treat = [{"cost_usd": 20.0 - (10.0 if i == 0 else 0.0), "pair_id": f"p{i}"} for i in range(20)]
+        res = ev.compare_metric("cost_usd", base, treat, 6, 0, 2000, 0.20, True)
+        self.assertEqual(res["estimand"], "mean_paired_difference")
+        self.assertAlmostEqual(res["delta"], -0.5)
+        self.assertLess(res["ci_low"], 0)
+        self.assertLessEqual(res["ci_low"], res["delta"])
+        self.assertLessEqual(res["delta"], res["ci_high"])
+
+    def test_guardrail_totals_use_both_arms(self):
+        base = self.write_cohort("base", "baseline", [make_row(f"b{i}", cost_usd=1.0 + 0.001 * i, tool_errors=1)
+                                                      for i in range(6)])
+        treat = self.write_cohort("treat", "treatment", [make_row(f"t{i}", cost_usd=0.5 + 0.001 * i,
+                                                                  tool_errors=2 if i == 0 else 1) for i in range(6)])
+        path = self.tmp / "r.json"
+        ev.main(["compare", "--baseline", str(base), "--treatment", str(treat), "--report", str(path)])
+        detail = {g["metric"]: g for g in json.loads(path.read_text(encoding="utf-8"))["guardrails_detail"]}
+        self.assertEqual((detail["tool_errors"]["baseline_total"], detail["tool_errors"]["treatment_total"],
+                          detail["tool_errors"]["delta_total"]), (6, 7, 1))
 
 if __name__ == "__main__":
     unittest.main()
