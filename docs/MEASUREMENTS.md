@@ -25,19 +25,26 @@ The first run of the first cohort paid for building the prompt cache. With
 ## 2. False-positive rate of the decision methods (simulation)
 
 A/A comparisons (both arms from the same distribution) on a cost distribution
-with mean 0.613 and CV 0.22, 400 simulations, 1,000 bootstrap resamples. The
+with mean 0.613 and CV 0.22, 4,000 simulations, 1,000 bootstrap resamples. The
 rate is the share of simulations in which the method declared a difference.
+Monte Carlo standard error is about 0.0035 at a 5% rate (it was about 0.011
+with the 400 simulations of 0.1.0).
 
 | n per arm | bootstrap, independent | bootstrap, paired | exact sign-flip, paired |
 |---:|---:|---:|---:|
-| 3 | 0.120 | 0.282 | 0.000 |
-| 5 | 0.033 | 0.163 | 0.000 |
-| 10 | 0.037 | 0.113 | 0.058 |
-| 20 | 0.043 | 0.068 | 0.050 (Monte Carlo) |
+| 3 | 0.098 | 0.251 | 0.000 |
+| 5 | 0.030 | 0.157 | 0.000 |
+| 10 | 0.038 | 0.098 | 0.052 |
+| 20 | 0.037 | 0.083 | 0.058 (Monte Carlo) |
 
 The paired bootstrap (of the mean paired difference, as the current code
 computes it) exceeded 0.05 at every n measured, hence the sign-flip test decides
-in paired mode and the paired bootstrap CI is descriptive only. The first
+in paired mode and the paired bootstrap CI is descriptive only. The sign-flip
+0.058 at n = 20 is about two standard errors above 0.05; two further seeds
+(11 and 23, 4,000 simulations each, same distribution) gave 0.0465 and 0.0493,
+so it is read as seed variation. The 0.1.0 table used 400 simulations:
+0.120 / 0.033 / 0.037 / 0.043 (independent), 0.282 / 0.163 / 0.113 / 0.068
+(paired bootstrap), 0.000 / 0.000 / 0.058 / 0.050 (sign-flip). The first
 measurement, made when the paired bootstrap still resampled the median, gave
 0.270 / 0.058 / 0.075 / 0.055 for that column and led to the same decision.
 This table is reproducible without any model calls:

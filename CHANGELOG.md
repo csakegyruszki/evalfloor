@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.1 - 2026-09-12
+
+No change to `run_eval.py` or the tests.
+
+- CI: GitHub Actions runs the unit and contract tests on Linux (Python 3.9-3.14), Windows
+  (3.9, 3.14) and macOS (3.14), plus a CLI smoke test. No test makes a model call.
+- A/A false-positive table recomputed with 4,000 simulations instead of 400 (Monte Carlo
+  standard error about 0.0035 at a 5% rate, down from about 0.011). The conclusion is unchanged:
+  the paired bootstrap exceeds 0.05 at every n, so the exact sign-flip test decides in paired
+  mode. The sign-flip 0.058 at n = 20 was checked with two further seeds (0.0465, 0.0493).
+  `docs/simulate_aa.py` reproduces the table.
+- README: `PASS` means cheaper and not operationally worse on the declared guardrails; it does
+  not mean a better agent.
+
 ## 0.1.0 - 2026-09-12
 
 First public version.

@@ -13,7 +13,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import run_eval as ev  # noqa: E402
 
-SIMS, RESAMPLES, SEED = 400, 1000, 7
+SIMS, RESAMPLES, SEED = 4000, 1000, 7  # 4000: Monte Carlo SE about 0.0035 at a 5% rate
 MEAN, CV = 0.613, 0.22
 MC_PERMS = 2000  # only used above n = 16, where the sign-flip test switches to Monte Carlo
 

@@ -40,6 +40,9 @@ or tokens can mean less thorough work, so those metrics are reported but never d
 answers a narrow question: did this change alter how the agent operates and what it costs, by more
 than its own noise? Pair it with a separate quality check when quality matters.
 
+`PASS` means cheaper, and not operationally worse on the declared guardrails. It does not mean a
+better agent.
+
 ## Quick start
 
 The `examples/` directory holds a small code-review task, a Python file with planted defects, and
@@ -207,16 +210,20 @@ completed rows for it (default 6, at least 5). Above that floor, the two modes d
 
 **Paired mode** decides differently. A Haiku A/A smoke run (two identical cohorts, same task,
 `--pair-id`) found the percentile bootstrap CI anti-conservative for a false-positive ("A/A")
-comparison, worse in paired mode. Measured false-PASS rate over 400 simulations on a cost
+comparison, worse in paired mode. Measured false-PASS rate over 4,000 simulations on a cost
 distribution calibrated to an early small Sonnet measurement (mean 0.613, CV 0.22), 1,000
-bootstrap resamples:
+bootstrap resamples. Monte Carlo standard error is about 0.0035 at a 5% rate:
 
 | n per arm | bootstrap independent | bootstrap paired | exact sign-flip (paired) |
 |---:|---:|---:|---:|
-| 3  | 0.120 | 0.282 | 0.000 |
-| 5  | 0.033 | 0.163 | 0.000 |
-| 10 | 0.037 | 0.113 | 0.058 |
-| 20 | 0.043 | 0.068 | 0.050 |
+| 3  | 0.098 | 0.251 | 0.000 |
+| 5  | 0.030 | 0.157 | 0.000 |
+| 10 | 0.038 | 0.098 | 0.052 |
+| 20 | 0.037 | 0.083 | 0.058 |
+
+The sign-flip 0.058 at n = 20 is about two standard errors above 0.05. Two further seeds gave
+0.0465 and 0.0493 (4,000 simulations each), so it is read as seed variation, not as an
+anti-conservative test.
 
 (Current code: the paired bootstrap resamples the mean paired difference. Reproduce with
 `python docs/simulate_aa.py`; `docs/MEASUREMENTS.md` also gives the first, median-based figures.)
