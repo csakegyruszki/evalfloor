@@ -1,4 +1,5 @@
 # evalfloor
+[![tests](https://github.com/csakegyruszki/evalfloor/actions/workflows/tests.yml/badge.svg)](https://github.com/csakegyruszki/evalfloor/actions/workflows/tests.yml) [![PyPI](https://img.shields.io/pypi/v/evalfloor)](https://pypi.org/project/evalfloor/)
 
 A small experimental harness for measuring whether a Claude Code configuration changes
 operational behaviour enough to distinguish it from normal run-to-run noise.
